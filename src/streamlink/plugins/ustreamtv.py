@@ -1,4 +1,5 @@
 import re
+import requests
 
 from collections import namedtuple
 from functools import partial
@@ -40,6 +41,8 @@ HLS_PLAYLIST_URL = (
 RECORDED_URL = "http://tcdn.ustream.tv/video/{0}"
 RTMP_URL = "rtmp://r{0}-1-{1}-channel-live.ums.ustream.tv:1935/ustream"
 SWF_URL = "http://static-cdn1.ustream.tv/swf/live/viewer.rsl:505.swf"
+UHS_GET_HOST_URL = 'http://tcdn.ustream.tv/{0}/?protocol=http'
+UHS_DEFAULT_HOST = 'http://uhs-live-default.ustream.tv'
 
 _module_info_schema = validate.Schema(
     list,
@@ -237,7 +240,7 @@ class UHSStreamWriter(SegmentedStreamWriter):
     def write(self, chunk, res, chunk_size=8192):
         try:
             for data in self.concater.iter_chunks(buf=res.content,
-                                                  skip_header=not chunk.offset):
+                                                  skip_header=chunk.offset):
                 self.reader.buffer.write(data)
 
                 if self.closed:
@@ -254,9 +257,9 @@ class UHSStreamWorker(SegmentedStreamWorker):
 
         self.chunk_ranges = {}
         self.chunk_id = None
-        self.chunk_id_max = None
         self.chunks = []
         self.filename_format = ""
+        self.stream_host = None
         self.module_info_reload_time = 2
         self.process_module_info()
 
@@ -307,8 +310,17 @@ class UHSStreamWorker(SegmentedStreamWorker):
             self.logger.error("Stream index not in result")
             return
 
+        if self.stream_host == None:
+            r = requests.get(UHS_GET_HOST_URL.format(self.stream.channel_id))
+            self.stream_host = r.text
+            self.logger.debug('provider url: ' + provider['url'])
+            self.logger.debug('new provider url: ' +
+                provider['url'].replace(UHS_DEFAULT_HOST, self.stream_host))
+
         filename_format = stream["streamName"].replace("%", "%s")
-        filename_format = urljoin(provider["url"], filename_format)
+        filename_format = urljoin(
+            provider['url'].replace(UHS_DEFAULT_HOST, self.stream_host),
+            filename_format)
 
         self.filename_format = filename_format
         self.update_chunk_info(stream)
@@ -321,16 +333,16 @@ class UHSStreamWorker(SegmentedStreamWorker):
         chunk_id = int(result["chunkId"])
         chunk_offset = int(result["offset"])
         chunk_range = {int(k): str(v) for k, v in chunk_range.items()}
-
         self.chunk_ranges.update(chunk_range)
-        self.chunk_id_min = sorted(chunk_range)[0]
-        self.chunk_id_max = int(result["chunkId"])
-        self.chunks = [Chunk(i, self.format_chunk_url(i),
-                             not self.chunk_id and i == chunk_id and chunk_offset)
-                       for i in range(self.chunk_id_min, self.chunk_id_max + 1)]
 
-        if self.chunk_id is None and self.chunks:
+        if self.chunk_id is None:
             self.chunk_id = chunk_id
+
+        for i in range(self.chunk_id, chunk_id + 1):
+            self.chunks.append(Chunk(i, self.format_chunk_url(i),
+                             not self.chunk_id and i == chunk_id and chunk_offset))
+
+        self.chunk_id = chunk_id + 1
 
     def format_chunk_url(self, chunk_id):
         chunk_hash = ""
@@ -340,20 +352,16 @@ class UHSStreamWorker(SegmentedStreamWorker):
 
         return self.filename_format % (chunk_id, chunk_hash)
 
-    def valid_chunk(self, chunk):
-        return self.chunk_id and chunk.num >= self.chunk_id
-
     def iter_segments(self):
         while not self.closed:
-            for chunk in filter(self.valid_chunk, self.chunks):
+            while len(self.chunks) > 0:
+                chunk = self.chunks.pop(0)
                 self.logger.debug("Adding chunk {0} to queue", chunk.num)
                 yield chunk
 
                 # End of stream
                 if self.closed:
                     return
-
-                self.chunk_id = chunk.num + 1
 
             if self.wait(self.module_info_reload_time):
                 try:
