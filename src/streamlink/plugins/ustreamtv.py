@@ -7,6 +7,7 @@ from time import sleep
 
 from streamlink.compat import urlparse, urljoin, range
 from streamlink.exceptions import StreamError, PluginError, NoStreamsError
+from streamlink.packages.flashmedia.types import ScriptDataReference
 from streamlink.plugin import Plugin, PluginOptions
 from streamlink.plugin.api import http, validate
 from streamlink.stream import RTMPStream, HLSStream, HTTPStream, Stream
@@ -21,7 +22,7 @@ try:
 except ImportError:
     HAS_LIBRTMP = False
 
-_url_re = re.compile(r"""
+_url_re = re.compile("""
     http(s)?://(www\.)?ustream.tv
     (?:
         (/embed/|/channel/id/)(?P<channel_id>\d+)
@@ -30,7 +31,7 @@ _url_re = re.compile(r"""
         /recorded/(?P<video_id>\d+)
     )?
 """, re.VERBOSE)
-_channel_id_re = re.compile(r"\"channelId\":(\d+)")
+_channel_id_re = re.compile("\"channelId\":(\d+)")
 
 HLS_PLAYLIST_URL = (
     "http://iphone-streaming.ustream.tv"
@@ -71,11 +72,11 @@ _recorded_schema = validate.Schema({
         }]
     )
 })
-_stream_schema = validate.Schema(
-    validate.any({
-        "name": validate.text,
-        "url": validate.text,
-        "streams": validate.all(
+_stream_schema = validate.Schema({
+    "name": validate.text,
+    "url": validate.text,
+    "streams": validate.any(
+        validate.all(
             _amf3_array,
             [{
                 "chunkId": validate.any(int, float),
@@ -89,13 +90,10 @@ _stream_schema = validate.Schema(
                 validate.optional("description"): validate.text,
                 validate.optional("isTranscoded"): bool
             }],
-        )
-    },
-    {
-        "name": validate.text,
-        "varnishUrl": validate.text
-    })
-)
+        ),
+        ScriptDataReference
+    )
+})
 _channel_schema = validate.Schema({
     validate.optional("stream"): validate.any(
         validate.all(
@@ -322,7 +320,7 @@ class UHSStreamWorker(SegmentedStreamWorker):
 
         chunk_id = int(result["chunkId"])
         chunk_offset = int(result["offset"])
-        chunk_range = dict(map(partial(map, int), chunk_range.items()))
+        chunk_range = {int(k): str(v) for k, v in chunk_range.items()}
 
         self.chunk_ranges.update(chunk_range)
         self.chunk_id_min = sorted(chunk_range)[0]
@@ -508,11 +506,14 @@ class UStreamTV(Plugin):
 
         streams = {}
         for provider in channel["stream"]:
-            if provider["name"] == u"uhs_akamai":  # not heavily tested, but got a stream working
+            try:
+                provider_url = provider["url"]
+                provider_name = provider["name"]
+            except KeyError:
                 continue
-            provider_url = provider["url"]
-            provider_name = provider["name"]
             for stream_index, stream_info in enumerate(provider["streams"]):
+                if not isinstance(stream_info, dict):
+                    continue
                 stream = None
                 stream_height = int(stream_info.get("height", 0))
                 stream_name = stream_info.get("description")
